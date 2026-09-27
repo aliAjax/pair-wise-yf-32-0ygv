@@ -13,23 +13,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from common import ApiError, iso, parse_time, utcnow
+from recall_store import RecallStore
+
 PORT = 8203
 ROLES = {"viewer", "hospital", "coordinator", "allocation_officer", "auditor"}
-STATUSES = {"proposed", "accepted", "in_transit", "handed_off", "implanted", "withdrawn", "expired"}
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str):
-        super().__init__(message); self.status, self.code, self.message = status, code, message
-
-
-def utcnow() -> datetime: return datetime.now(timezone.utc)
-def iso(value: datetime | None = None) -> str: return (value or utcnow()).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-def parse_time(value: str | None) -> datetime:
-    if not value: raise ApiError(400, "time_required", "必须提供 ISO 8601 时间")
-    try: parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc: raise ApiError(400, "invalid_time", f"时间格式错误: {value}") from exc
-    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+STATUSES = {"proposed", "accepted", "in_transit", "handed_off", "implanted", "withdrawn", "expired", "recalled"}
 
 
 def blood_compatible(donor: str, recipient: str) -> bool:
@@ -74,6 +63,7 @@ class Repository:
             action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         """)
+        RecallStore.init(self.conn)
 
     @contextmanager
     def tx(self):
@@ -91,6 +81,13 @@ class Repository:
 
 class OrganAllocationService:
     def __init__(self, path: str | Path): self.repo = Repository(path)
+
+    @property
+    def recalls(self) -> "RecallService":
+        cached = getattr(self, "_recalls", None)
+        if cached is None:
+            cached = RecallService(self); self._recalls = cached
+        return cached
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -158,6 +155,7 @@ class OrganAllocationService:
         with self.repo.tx() as conn:
             donor = conn.execute("SELECT * FROM donors WHERE id=?", (donor_id,)).fetchone(); candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
             if not donor or not candidate: raise ApiError(404, "not_found", "器官或候选患者不存在")
+            RecallService.assert_donor_not_recalled(conn, donor_id)
             if donor["status"] != "available": raise ApiError(409, "donor_unavailable", "器官当前不可分配")
             if parse_time(donor["expires_at"]) <= utcnow():
                 conn.execute("UPDATE donors SET status='expired',revision=revision+1 WHERE id=?", (donor_id,))
@@ -192,7 +190,7 @@ class OrganAllocationService:
     def _ensure_active(self, conn: sqlite3.Connection, allocation_id: int, actor: str, role: str) -> sqlite3.Row:
         row = conn.execute("SELECT * FROM allocations WHERE id=?", (allocation_id,)).fetchone()
         if not row: raise ApiError(404, "allocation_not_found", "分配不存在")
-        if row["status"] in {"withdrawn", "expired", "implanted"}: raise ApiError(409, "allocation_closed", "分配已结束")
+        if row["status"] in {"withdrawn", "expired", "implanted", "recalled"}: raise ApiError(409, "allocation_closed", "分配已结束")
         donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
         if parse_time(donor["expires_at"]) <= utcnow():
             conn.execute("UPDATE allocations SET status='expired',revision=revision+1,updated_at=? WHERE id=?", (iso(), allocation_id))
@@ -311,15 +309,49 @@ class OrganAllocationService:
             donors = [dict(r) for r in conn.execute("SELECT * FROM donors WHERE hospital=?", (hospital,))]
             candidates = [dict(r) for r in conn.execute("SELECT * FROM candidates WHERE hospital=?", (hospital,))]
             allocated = [dict(r) for r in conn.execute("SELECT a.* FROM allocations a JOIN candidates c ON c.id=a.candidate_id WHERE c.hospital=?", (hospital,))]
+            result = {"donors": donors, "candidates": candidates, "allocations": allocated, "server_time": iso()}
+            result.update(self.recalls.hospital_digest(conn, hospital))
+            return result
         elif role == "viewer":
             donors = []
             candidates = []
             allocated = [dict(r) for r in conn.execute("SELECT id,status,updated_at FROM allocations WHERE status='implanted' ORDER BY id DESC")]
+            return {"donors": donors, "candidates": candidates, "allocations": allocated, "server_time": iso()}
         else:
             donors = [dict(r) for r in conn.execute("SELECT * FROM donors ORDER BY id DESC")]
             candidates = [dict(r) for r in conn.execute("SELECT * FROM candidates ORDER BY id DESC")]
             allocated = [dict(r) for r in conn.execute("SELECT * FROM allocations ORDER BY id DESC")]
-        return {"donors": donors, "candidates": candidates, "allocations": allocated, "server_time": iso()}
+            recalls = self.recall_console(conn)
+            return {"donors": donors, "candidates": candidates, "allocations": allocated,
+                    "recalls": recalls, "server_time": iso()}
+
+    def recall_console(self, conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
+        """协调台视图：受影响医院、召回当前状态、未确认数量。"""
+        if conn is None:
+            with self.repo.tx() as conn:
+                return self.recall_console(conn)
+        rows = RecallStore.list_recalls(conn)
+        return [
+            {"id": r["id"], "donor_id": r["donor_id"], "risk_type": r["risk_type"],
+             "report_source": r["report_source"], "occurred_at": r["occurred_at"], "status": r["status"],
+             "affected_hospitals": sorted({n["hospital"] for n in RecallStore.list_notifications(conn, r["id"])}),
+             "stopped_count": conn.execute(
+                 "SELECT COUNT(*) FROM recall_notifications WHERE recall_id=? AND disposition='stopped'", (r["id"],)).fetchone()[0],
+             "followup_count": conn.execute(
+                 "SELECT COUNT(*) FROM recall_notifications WHERE recall_id=? AND disposition='followup_only'", (r["id"],)).fetchone()[0],
+             "total_notifications": conn.execute(
+                 "SELECT COUNT(*) FROM recall_notifications WHERE recall_id=?", (r["id"],)).fetchone()[0],
+             "acknowledged_count": conn.execute(
+                 "SELECT COUNT(*) FROM recall_notifications WHERE recall_id=? AND acknowledged=1", (r["id"],)).fetchone()[0],
+             "pending_count": conn.execute(
+                 "SELECT COUNT(*) FROM recall_notifications WHERE recall_id=? AND acknowledged=0", (r["id"],)).fetchone()[0]}
+            for r in rows
+        ]
+
+
+# 召回判定层在文件末尾导入：recall.py 反向依赖本模块的 ApiError/Repository 等符号。
+from recall import RecallService  # noqa: E402
+import recall_api  # noqa: E402
 
 
 def json_reply(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -344,6 +376,8 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "donors"] and parts[2].isdigit() and parts[3] == "ranking": return 200, self.service.ranking(int(parts[2]), role, hospital)
         if len(parts) == 3 and parts[:2] == ["api", "allocations"] and parts[2].isdigit(): return 200, self.service.get_allocation(int(parts[2]), role, hospital)
         if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit() and parts[3] == "audit": return 200, {"audit": self.service.audit(int(parts[2]), role)}
+        recalled = recall_api.dispatch_get(self, parts, actor, role, hospital)
+        if recalled is not None: return recalled
         raise ApiError(404, "not_found", "接口不存在")
     def dispatch_post(self, path: str) -> tuple[int, Any]:
         actor, role, hospital = self.service.identity(self.headers); body = self.read_body(); parts = [p for p in path.split("/") if p]
@@ -365,6 +399,8 @@ class Handler(BaseHTTPRequestHandler):
                 "implant": lambda: self.service.implant(aid, actor, role, body),
             }
             if action in routes: return 200, routes[action]()
+        recalled = recall_api.dispatch_post(self, parts, actor, role, hospital, body)
+        if recalled is not None: return recalled
         raise ApiError(404, "not_found", "接口不存在")
     def handle_any(self, method: str) -> None:
         parsed = urlparse(self.path)
