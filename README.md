@@ -21,7 +21,12 @@ python3 app.py --db organ_allocation.db
 - `POST /api/allocations/{id}/transit`、`delay`：冷链转运和延误上报。
 - `POST /api/allocations/{id}/handoff`、`handoff-accept`：来源医院发起、接收医院确认。
 - `POST /api/allocations/{id}/implant`：确认植入。
+- `POST /api/recalls`：协调员登记供体安全召回（风险类型、报告来源、发生时刻）。系统找出该供体全部分配：未植入的立即停住后续交接，已植入的只生成受者随访并保留原状态；同一风险重复登记返回首次结果。
+- `POST /api/recalls/{id}/acknowledge`、`close`：接收医院逐条确认召回通知，全部确认前召回不能关闭。
+- `GET /api/recalls`、`GET /api/recalls/{id}`：召回视图；协调台 `/api/state` 展示受影响医院、当前状态和未确认数量，医院视图含本院待确认通知。
 - `GET /api/allocations/{id}/audit`、`GET /api/state`：完整审计和权限视图。
+
+召回判定、记录存取和请求入口分别在 `recall_policy.py`、`recall_store.py`、`recall_api.py` 三个业务文件维护。
 
 ## 测试
 
